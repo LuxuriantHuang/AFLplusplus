@@ -1661,6 +1661,13 @@ inline u8 *queue_testcase_get(afl_state_t *afl, struct queue_entry *q) {
 
   if (unlikely(fd < 0)) { PFATAL("Unable to open '%s'", (char *)q->fname); }
 
+  struct stat st;
+  if (fstat(fd, &st) == 0) {
+    /* Debug logging disabled. */
+    // WARNF("DEBUG queue_testcase_get: file=%s, q->len=%u, st.st_size=%lu",
+    //        (char *)q->fname, len, st.st_size);
+  }
+
   q->testcase_buf = (u8 *)malloc(len);
 
   if (unlikely(!q->testcase_buf)) {
@@ -1753,4 +1760,3 @@ inline void queue_testcase_store_mem(afl_state_t *afl, struct queue_entry *q,
   }
 
 }
-

@@ -870,24 +870,35 @@ void sync_fuzzers(afl_state_t *afl) {
         u32 orig_len = st.st_size;
         u8 *orig_mem = mem;
 
-        /* Debug logging disabled. */
-        // WARNF("DEBUG: File %s, orig_len=%u, orig_mem=%p",
-        //       namelist[o]->d_name, orig_len, (void *)orig_mem);
+        /* See what happens. We rely on save_if_interesting() to catch major
+           errors and save the test case. */
 
-        /* Write to queue file BEFORE write_to_testcase modifies mem */
-        u8 queue_fn[PATH_MAX];
-        u8 new_bits = 0;
-        u8 force_sync = 0;
+        u32 new_len = write_to_testcase(afl, (void **)&mem, orig_len, 1);
+
+        fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+
+        if (afl->stop_soon) {
+
+          munmap(mem, orig_len);
+          close(fd);
+
+          goto close_sync;
+
+        }
+
+        afl->syncing_party = sd_ent->d_name;
 
         /* Check if syncing from LLM or MUT instance for unconditional sync */
+        u8 force_sync = 0;
         if (strstr(sd_ent->d_name, "LLM") != NULL || strstr(sd_ent->d_name, "llm") != NULL ||
             strstr(sd_ent->d_name, "MUT") != NULL || strstr(sd_ent->d_name, "mut") != NULL) {
           force_sync = 1;
         }
 
         if (force_sync) {
-          /* Determine filename and check coverage */
-          new_bits = has_new_bits(afl, afl->virgin_bits);
+          /* LLM/MUT: Add to queue unconditionally, but check for new coverage */
+          u8 queue_fn[PATH_MAX];
+          u8 new_bits = has_new_bits(afl, afl->virgin_bits);
 
           if (new_bits) {
             if (src_id[0]) {
@@ -907,71 +918,21 @@ void sync_fuzzers(afl_state_t *afl) {
             }
           }
 
-          /* Write to queue file BEFORE write_to_testcase modifies mem */
+          /* Debug: Log sync details */
+          ACTF("Syncing from %s: orig_len=%u, file=%s", sd_ent->d_name, orig_len, queue_fn);
+
+          /* Use original file size for writing to queue */
           int qfd = open(queue_fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
           if (qfd >= 0) {
-            ssize_t written = write(qfd, orig_mem, orig_len);
-            if (written != (ssize_t)orig_len) {
-              WARNF("Short write! fd=%d, written=%zd, orig_len=%u", qfd, written, orig_len);
-              close(qfd);
-              continue;
+            s32 written = write(qfd, mem, orig_len);
+            if (written != orig_len) {
+              WARNF("Short write to %s: %d of %u bytes", queue_fn, written, orig_len);
             }
-
-            /* Verify close succeeded - it can fail with EIO on network filesystems */
-            if (close(qfd) < 0) {
-              WARNF("Failed to close queue file %s: %s", queue_fn, strerror(errno));
-              continue;
-            }
-
-            /* Verify file was written correctly by checking its size */
-            struct stat qst;
-            if (stat(queue_fn, &qst) == 0) {
-              if (qst.st_size != orig_len) {
-                WARNF("File size mismatch after write! %s: expected %u, got %lu",
-                      queue_fn, orig_len, qst.st_size);
-                continue;
-              }
-            } else {
-              WARNF("Failed to stat queue file %s: %s", queue_fn, strerror(errno));
-              continue;
-            }
-
-            add_to_queue(afl, ck_strdup((char *)queue_fn), orig_len, 0);
+            close(qfd);
+            add_to_queue(afl, queue_fn, orig_len, 0);
             afl->queued_imported++;
-
-            /* Debug logging disabled. */
-            // WARNF("Synced: file=%s, wrote=%zd/%u, verified_size=%lu",
-            //       queue_fn, written, orig_len, qst.st_size);
           }
-        }
-
-        /* See what happens. We rely on save_if_interesting() to catch major
-           errors and save the test case. */
-
-        /* Debug logging disabled. */
-        // WARNF("DEBUG: Before write_to_testcase: mem=%p, orig_mem=%p, "
-        //       "orig_len=%u", (void *)mem, (void *)orig_mem, orig_len);
-
-        u32 new_len = write_to_testcase(afl, (void **)&mem, orig_len, 1);
-
-        /* Debug logging disabled. */
-        // WARNF("DEBUG: After write_to_testcase: mem=%p, new_len=%u, "
-        //       "orig_len=%u", (void *)mem, new_len, orig_len);
-
-        fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
-
-        if (afl->stop_soon) {
-
-          munmap(orig_mem, orig_len);
-          close(fd);
-
-          goto close_sync;
-
-        }
-
-        afl->syncing_party = sd_ent->d_name;
-
-        if (!force_sync) {
+        } else {
           /* Other instances: Use normal save_if_interesting filtering */
           afl->queued_imported += save_if_interesting(afl, mem, new_len, fault);
         }
@@ -979,7 +940,7 @@ void sync_fuzzers(afl_state_t *afl) {
         show_stats(afl);
         afl->syncing_party = 0;
 
-        munmap(orig_mem, orig_len);
+        munmap(mem, st.st_size);
 
       }
 
@@ -1337,3 +1298,4 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
   return 0;
 
 }
+

@@ -585,15 +585,22 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
       for (i = 0; i < (u32)nl_cnt; ++i) {
 
         struct stat st;
+        u8          src_id[16] = {0};  /* Store original source ID */
 
-        u8 *fn2 =
-            alloc_printf("%s/%s", afl->foreign_syncs[iter].dir, nl[i]->d_name);
+        u8 *entry_name = ck_strdup(nl[i]->d_name);
+        u8 *fn2 = alloc_printf("%s/%s", afl->foreign_syncs[iter].dir, entry_name);
 
         free(nl[i]);                                         /* not tracked */
+
+        /* Extract original ID from filename (e.g., "id:000456" from "id:000456,src:LLM") */
+        if (strncmp((char *)entry_name, "id:", 3) == 0) {
+          snprintf(src_id, sizeof(src_id), "src:%.6s", entry_name + 3);
+        }
 
         if (unlikely(lstat(fn2, &st) || access(fn2, R_OK))) {
 
           if (first) PFATAL("Unable to access '%s'", fn2);
+          ck_free(entry_name);
           ck_free(fn2);
           continue;
 
@@ -602,6 +609,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
         /* we detect new files by their mtime */
         if (likely(st.st_mtime <= afl->foreign_syncs[iter].mtime)) {
 
+          ck_free(entry_name);
           ck_free(fn2);
           continue;
 
@@ -611,6 +619,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
         if (!S_ISREG(st.st_mode) || !st.st_size || strstr(fn2, "/README.txt")) {
 
+          ck_free(entry_name);
           ck_free(fn2);
           continue;
 
@@ -627,6 +636,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
           }
 
+          ck_free(entry_name);
           ck_free(fn2);
           continue;
 
@@ -650,13 +660,97 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
         }
 
-        u32 len = write_to_testcase(afl, (void **)&mem, st.st_size, 1);
+        /* Save original file size and content before write_to_testcase modifies it */
+        u32 orig_len = st.st_size;
+        u8 *orig_mem = mem;
+
+        /* Write to queue file BEFORE write_to_testcase modifies mem */
+        u8 queue_fn[PATH_MAX];
+        u8 new_bits = 0;
+        u8 force_sync = 0;
+
+        /* Check if this is LLM or MUT foreign queue for unconditional sync */
+        if (strstr(foreign_name, "LLM") != NULL || strstr(foreign_name, "llm") != NULL ||
+            strstr(foreign_name, "MUT") != NULL || strstr(foreign_name, "mut") != NULL) {
+          force_sync = 1;
+        }
+
+        if (force_sync) {
+          /* Determine filename and check coverage */
+          new_bits = has_new_bits(afl, afl->virgin_bits);
+
+          if (new_bits) {
+            if (src_id[0]) {
+              snprintf(queue_fn, sizeof(queue_fn), "%s/queue/id:%06u,sync:%s,%s,+cov",
+                       afl->out_dir, afl->queued_items, foreign_name, src_id);
+            } else {
+              snprintf(queue_fn, sizeof(queue_fn), "%s/queue/id:%06u,sync:%s,+cov",
+                       afl->out_dir, afl->queued_items, foreign_name);
+            }
+          } else {
+            if (src_id[0]) {
+              snprintf(queue_fn, sizeof(queue_fn), "%s/queue/id:%06u,sync:%s,%s",
+                       afl->out_dir, afl->queued_items, foreign_name, src_id);
+            } else {
+              snprintf(queue_fn, sizeof(queue_fn), "%s/queue/id:%06u,sync:%s",
+                       afl->out_dir, afl->queued_items, foreign_name);
+            }
+          }
+
+          /* Write to queue file BEFORE write_to_testcase modifies mem */
+          int qfd = open(queue_fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
+          if (qfd >= 0) {
+            ssize_t written = write(qfd, orig_mem, orig_len);
+            if (written != (ssize_t)orig_len) {
+              WARNF("Short write! fd=%d, written=%zd, orig_len=%u", qfd, written, orig_len);
+              close(qfd);
+              continue;
+            }
+
+            /* Verify close succeeded - it can fail with EIO on network filesystems */
+            if (close(qfd) < 0) {
+              WARNF("Failed to close queue file %s: %s", queue_fn, strerror(errno));
+              continue;
+            }
+
+            /* Verify file was written correctly by checking its size */
+            struct stat qst;
+            if (stat(queue_fn, &qst) == 0) {
+              if (qst.st_size != orig_len) {
+                WARNF("File size mismatch after write! %s: expected %u, got %lu",
+                      queue_fn, orig_len, qst.st_size);
+                continue;
+              }
+            } else {
+              WARNF("Failed to stat queue file %s: %s", queue_fn, strerror(errno));
+              continue;
+            }
+
+            add_to_queue(afl, ck_strdup((char *)queue_fn), orig_len, 0);
+            afl->queued_imported++;
+
+            /* Debug logging disabled. */
+            // ACTF("Importing from %s: orig_len=%u, file=%s, verified_size=%lu",
+            //      foreign_name, orig_len, queue_fn, qst.st_size);
+          }
+        }
+
+        /* See what happens. We rely on save_if_interesting() to catch major
+           errors and save the test case. */
+
+        u32 len = write_to_testcase(afl, (void **)&mem, orig_len, 1);
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
         afl->syncing_party = foreign_name;
-        afl->queued_imported += save_if_interesting(afl, mem, len, fault);
+
+        if (!force_sync) {
+          /* Other foreign queues: Use normal save_if_interesting filtering */
+          afl->queued_imported += save_if_interesting(afl, mem, len, fault);
+        }
+
         afl->syncing_party = 0;
-        munmap(mem, st.st_size);
+        munmap(orig_mem, orig_len);
         close(fd);
+        ck_free(entry_name);
 
         if (st.st_mtime > mtime_max) {
 
@@ -3330,4 +3424,3 @@ void save_cmdline(afl_state_t *afl, u32 argc, char **argv) {
   *buf = 0;
 
 }
-
